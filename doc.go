@@ -70,6 +70,63 @@
 // falsy; a bare {{else}} (or {{^}}) separates the main and inverse bodies of any
 // block.
 //
+// Chained conditionals are written with {{else if}} (and {{else unless}} /
+// {{else with}}):
+//
+//	{{#if a}}A{{else if b}}B{{else}}C{{/if}}
+//
+// # Block parameters
+//
+// Blocks may name the values they yield with an "as |a b|" clause. {{#each}}
+// binds the element and the index (or key); {{#with}} binds the value:
+//
+//	{{#each items as |item index|}}{{index}}:{{item}}{{/each}}
+//	{{#with obj as |o|}}{{o.field}}{{/with}}
+//
+// Block parameters are lexically scoped and shadow the surrounding context.
+// Custom block helpers pass them via Options.FnWithBlockParams.
+//
+// # Data variables
+//
+// Within blocks the following @-data variables are available: @root (the
+// top-level context), @index and @key (position/key in an #each), @first and
+// @last (loop-edge flags), and @level (block nesting depth). A parent loop's
+// data is reached with the ../ prefix, e.g. @../index. Data variables can be
+// disabled at compile time with the NoData option.
+//
+// # Inline partials, partial blocks and decorators
+//
+// Inline partials are declared with the built-in inline decorator and are
+// visible to the surrounding scope:
+//
+//	{{#*inline "row"}}[{{name}}]{{/inline}}
+//	{{#each people}}{{> row}}{{/each}}
+//
+// A partial block passes its body to the invoked partial as @partial-block, the
+// mechanism behind layout templates:
+//
+//	{{#> layout}}page body{{/layout}}   with layout = "<main>{{> @partial-block}}</main>"
+//
+// If the partial is undefined the block body renders as a fallback. Decorators
+// are registered with RegisterDecorator and invoked as {{* name}} (inline) or
+// {{#*name}}...{{/name}} (block); the built-in inline decorator implements
+// inline partials.
+//
+// # Helper-missing hooks
+//
+// Registering a helper named "helperMissing" or "blockHelperMissing" intercepts
+// references to unknown helpers and unknown block helpers respectively, matching
+// the Handlebars.js hooks. Without a hook, a bare {{foo}} for an unknown name is
+// empty, {{foo arg}} is an error, and {{#foo}} falls back to Mustache section
+// behaviour.
+//
+// # Compile options
+//
+// Compile accepts options mirroring Handlebars.compile: NoEscape (emit {{expr}}
+// unescaped), Strict (missing paths/helpers are errors), NoData (disable
+// @-data), and KnownHelpers / KnownHelpersOnly (restrict which names are treated
+// as helper calls).
+//
 // # Built-in inline helpers
 //
 // These are handy on their own and inside subexpressions: lookup, eq, ne, not,

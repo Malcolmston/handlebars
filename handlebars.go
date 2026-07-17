@@ -1,6 +1,10 @@
 package handlebars
 
-import "strings"
+import (
+	"log"
+	"os"
+	"strings"
+)
 
 // Helper is the signature for all helpers, both inline and block. The return
 // value is stringified for output; return a SafeString to bypass HTML escaping.
@@ -9,28 +13,59 @@ import "strings"
 type Helper func(*Options) interface{}
 
 // Template is a compiled Handlebars template together with its own registry of
-// helpers and partials. Templates are safe for concurrent use once compiled and
-// fully configured (register helpers and partials before rendering).
+// helpers, partials and decorators. Templates are safe for concurrent use once
+// compiled and fully configured (register helpers, partials and options before
+// rendering).
 type Template struct {
-	prog     *Program
-	helpers  map[string]Helper
-	partials map[string]*Program
+	prog       *Program
+	helpers    map[string]Helper
+	partials   map[string]*Program
+	decorators map[string]Decorator
+	cfg        config
+	logger     *log.Logger
 }
 
-// New creates an empty Template pre-populated with the built-in helpers. Use
-// Parse to attach a source, or compile in one step with the package-level Parse.
+// config holds the compile-time options that mirror Handlebars.js compile flags.
+type config struct {
+	noEscape         bool            // do not HTML-escape {{expr}} output
+	strict           bool            // missing paths/helpers are errors
+	data             bool            // enable @-data variables (default true)
+	knownHelpers     map[string]bool // helper names known at compile time
+	knownHelpersOnly bool            // treat only knownHelpers as helpers
+}
+
+// New creates an empty Template pre-populated with the built-in helpers and
+// decorators. Use Parse to attach a source, or compile in one step with the
+// package-level Parse.
 func New() *Template {
 	t := &Template{
-		helpers:  map[string]Helper{},
-		partials: map[string]*Program{},
+		helpers:    map[string]Helper{},
+		partials:   map[string]*Program{},
+		decorators: map[string]Decorator{},
+		cfg:        config{data: true, knownHelpers: map[string]bool{}},
+		logger:     log.New(os.Stderr, "", log.LstdFlags),
 	}
 	registerBuiltins(t)
+	registerBuiltinDecorators(t)
 	return t
 }
 
 // Parse compiles source into a new Template that includes the built-in helpers.
 func Parse(source string) (*Template, error) {
 	t := New()
+	if err := t.ParseString(source); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// Compile is like Parse but applies the given compile options (NoEscape, Strict,
+// KnownHelpers and so on), mirroring Handlebars.compile's options argument.
+func Compile(source string, opts ...Option) (*Template, error) {
+	t := New()
+	for _, opt := range opts {
+		opt(&t.cfg)
+	}
 	if err := t.ParseString(source); err != nil {
 		return nil, err
 	}

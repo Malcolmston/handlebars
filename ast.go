@@ -37,25 +37,41 @@ func (*MustacheNode) node() {}
 // Program holds the main body. Inverse holds the {{else}} body (or the body of
 // an {{^inverse}} form). Inverted is true when the block was written using the
 // {{^name}} shorthand, in which case Program and Inverse are conceptually
-// swapped by the parser (body lives in Inverse).
+// swapped by the parser (body lives in Inverse). Params holds the names declared
+// by a block-parameter clause such as {{#each xs as |item index|}}.
 type BlockNode struct {
 	Expr     *Expr
 	Program  *Program
 	Inverse  *Program
 	Inverted bool
+	Params   []string
 }
 
 func (*BlockNode) node() {}
 
 // PartialNode is a partial invocation such as {{> name}} or {{> name ctx}}.
+//
+// Program is non-nil for a partial block ({{#> layout}}...{{/layout}}); its
+// body becomes the @partial-block available inside the invoked partial.
 type PartialNode struct {
 	Name    *Expr // literal name, path, or subexpression (dynamic partial)
 	Context *Expr // optional explicit context argument
 	Hash    []HashPair
-	Indent  string // leading indentation for standalone partials
+	Indent  string   // leading indentation for standalone partials
+	Program *Program // partial-block body, or nil for a simple partial
 }
 
 func (*PartialNode) node() {}
+
+// DecoratorNode is a decorator invocation. The inline form {{* name args}} has a
+// nil Program; the block form {{#*name args}}...{{/name}} carries its body in
+// Program. The built-in inline decorator registers Program as a named partial.
+type DecoratorNode struct {
+	Expr    *Expr
+	Program *Program
+}
+
+func (*DecoratorNode) node() {}
 
 // exprKind classifies an Expr.
 type exprKind int

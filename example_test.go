@@ -57,3 +57,47 @@ No people.
 	// 1. Lin (Blue)
 	// Total: 2
 }
+
+// Example_advanced demonstrates block parameters, an {{else if}} chain, inline
+// partials and a partial block with @partial-block.
+func Example_advanced() {
+	const src = `{{#*inline "badge"}}[{{label}}]{{/inline}}` +
+		`{{#each users as |user index|}}` +
+		`{{index}}:{{user.name}} ` +
+		`{{#if (gt user.score 90)}}A{{else if (gt user.score 80)}}B{{else}}C{{/if}} ` +
+		`{{> badge label=user.role}}` + "\n" +
+		`{{/each}}`
+
+	out, err := handlebars.Render(src, map[string]interface{}{
+		"users": []map[string]interface{}{
+			{"name": "Ada", "score": 95, "role": "lead"},
+			{"name": "Lin", "score": 84, "role": "dev"},
+			{"name": "Sam", "score": 70, "role": "intern"},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(out)
+
+	// Output:
+	// 0:Ada A [lead]
+	// 1:Lin B [dev]
+	// 2:Sam C [intern]
+}
+
+// Example_partialBlock shows a layout partial wrapping caller-supplied content
+// via @partial-block.
+func Example_partialBlock() {
+	t := handlebars.New()
+	if err := t.RegisterPartial("layout", "<main>{{> @partial-block}}</main>"); err != nil {
+		panic(err)
+	}
+	if err := t.ParseString("{{#> layout}}Hello {{name}}{{/layout}}"); err != nil {
+		panic(err)
+	}
+	fmt.Println(t.MustRender(map[string]interface{}{"name": "World"}))
+
+	// Output:
+	// <main>Hello World</main>
+}

@@ -1,6 +1,10 @@
 package handlebars
 
-import "reflect"
+import (
+	"fmt"
+	"reflect"
+	"strings"
+)
 
 // registerBuiltins installs the standard inline helpers. The block helpers
 // if/unless/each/with are handled directly by the renderer so they cannot be
@@ -8,6 +12,7 @@ import "reflect"
 // subexpressions such as {{#if (eq a b)}}.
 func registerBuiltins(t *Template) {
 	t.helpers["lookup"] = helperLookup
+	t.helpers["log"] = helperLog
 	t.helpers["eq"] = helperEq
 	t.helpers["ne"] = helperNe
 	t.helpers["not"] = helperNot
@@ -27,6 +32,24 @@ func helperLookup(o *Options) interface{} {
 	}
 	v, _ := lookup(o.Args[0], formatValue(o.Args[1]))
 	return v
+}
+
+// helperLog implements {{log msg ...}}: it writes its arguments to the
+// template's logger (stderr by default, override with SetLogger) and produces no
+// output. A level="..." hash argument is prefixed to the message.
+func helperLog(o *Options) interface{} {
+	parts := make([]string, len(o.Args))
+	for i, a := range o.Args {
+		parts[i] = formatValue(a)
+	}
+	msg := strings.Join(parts, " ")
+	if lvl, ok := o.Hash["level"]; ok {
+		msg = fmt.Sprintf("[%s] %s", formatValue(lvl), msg)
+	}
+	if o.r != nil && o.r.tmpl.logger != nil {
+		o.r.tmpl.logger.Println(msg)
+	}
+	return ""
 }
 
 func helperEq(o *Options) interface{} {

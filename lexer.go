@@ -17,13 +17,17 @@ const (
 type mKind int
 
 const (
-	mkInterp     mKind = iota // {{ expr }}
-	mkUnescaped               // {{{ expr }}} or {{& expr }}
-	mkComment                 // {{! }} or {{!-- --}}
-	mkBlockOpen               // {{# expr }}
-	mkInverse                 // {{^ expr }} (or bare {{^}})
-	mkBlockClose              // {{/ name }}
-	mkPartial                 // {{> name }}
+	mkInterp         mKind = iota // {{ expr }}
+	mkUnescaped                   // {{{ expr }}} or {{& expr }}
+	mkComment                     // {{! }} or {{!-- --}}
+	mkBlockOpen                   // {{# expr }}
+	mkInverse                     // {{^ expr }} (or bare {{^}})
+	mkElse                        // {{else}} or {{else if cond}} chain separator
+	mkBlockClose                  // {{/ name }}
+	mkPartial                     // {{> name }}
+	mkPartialBlock                // {{#> name }} ... {{/name}}
+	mkDecorator                   // {{* name }}
+	mkDecoratorBlock              // {{#*name }} ... {{/name}}
 )
 
 // token is a lexical unit produced by the outer lexer.
@@ -203,8 +207,17 @@ func (l *lexer) lexMustache() (token, error) {
 	kind := mkInterp
 	switch l.peek() {
 	case '#':
-		kind = mkBlockOpen
 		l.advance(1)
+		switch l.peek() {
+		case '*':
+			kind = mkDecoratorBlock
+			l.advance(1)
+		case '>':
+			kind = mkPartialBlock
+			l.advance(1)
+		default:
+			kind = mkBlockOpen
+		}
 	case '/':
 		kind = mkBlockClose
 		l.advance(1)
@@ -217,6 +230,9 @@ func (l *lexer) lexMustache() (token, error) {
 	case '&':
 		kind = mkUnescaped
 		l.advance(1)
+	case '*':
+		kind = mkDecorator
+		l.advance(1)
 	}
 
 	inner, err := l.readUntil("}}")
@@ -226,10 +242,11 @@ func (l *lexer) lexMustache() (token, error) {
 	trimRight, body := trailingTilde(inner)
 	body = strings.TrimSpace(body)
 
-	// A bare {{else}} is normalised to an inverse marker for the parser.
-	if kind == mkInterp && body == "else" {
-		kind = mkInverse
-		body = ""
+	// A bare {{else}} or {{else if cond}} chain separator is normalised to an
+	// mkElse marker for the parser. The remainder (e.g. "if cond") is retained.
+	if kind == mkInterp && (body == "else" || strings.HasPrefix(body, "else ")) {
+		kind = mkElse
+		body = strings.TrimSpace(strings.TrimPrefix(body, "else"))
 	}
 
 	return token{kind: tMustache, mkind: kind, text: body,
@@ -305,7 +322,8 @@ func markStandalone(toks []token) {
 			continue
 		}
 		switch t.mkind {
-		case mkBlockOpen, mkBlockClose, mkInverse, mkComment, mkPartial:
+		case mkBlockOpen, mkBlockClose, mkInverse, mkElse, mkComment,
+			mkPartial, mkPartialBlock, mkDecorator, mkDecoratorBlock:
 			// eligible
 		default:
 			continue

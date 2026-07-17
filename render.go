@@ -53,16 +53,45 @@ func (o *Options) Fn(ctx interface{}) string {
 // FnWith renders the block body with ctx as context and the supplied
 // @-variables layered onto the frame's data.
 func (o *Options) FnWith(ctx interface{}, data map[string]interface{}) string {
+	return o.fnProg(o.mainProg(), ctx, data, nil)
+}
+
+// FnWithBlockParams renders the block body binding the block's declared "as |a
+// b|" parameters to params, in declaration order.
+func (o *Options) FnWithBlockParams(ctx interface{}, params ...interface{}) string {
+	return o.fnProg(o.mainProg(), ctx, nil, params)
+}
+
+// BlockParams returns the names declared by the block's "as |a b|" clause.
+func (o *Options) BlockParams() []string {
 	if o.block == nil {
-		return ""
+		return nil
 	}
-	prog := o.block.mainProg()
+	return o.block.Params
+}
+
+func (o *Options) mainProg() *Program {
+	if o.block == nil {
+		return nil
+	}
+	return o.block.mainProg()
+}
+
+func (o *Options) fnProg(prog *Program, ctx interface{}, data map[string]interface{}, params []interface{}) string {
 	if prog == nil {
 		return ""
 	}
 	child := o.frame.child(ctx)
 	for k, v := range data {
 		child.data[k] = v
+	}
+	if len(params) > 0 && o.block != nil && len(o.block.Params) > 0 {
+		child.blockParams = map[string]interface{}{}
+		for i, name := range o.block.Params {
+			if i < len(params) {
+				child.blockParams[name] = params[i]
+			}
+		}
 	}
 	return o.r.renderProgramToString(prog, child)
 }
@@ -155,12 +184,28 @@ func (r *renderer) renderNode(n Node, f *frame) {
 		r.renderBlock(node, f)
 	case *PartialNode:
 		r.renderPartial(node, f)
+	case *DecoratorNode:
+		r.renderDecorator(node, f)
 	}
+}
+
+// renderDecorator evaluates a decorator invocation ({{* name}} or the block form
+// {{#*name}}...{{/name}}). Decorators produce no direct output; they mutate the
+// surrounding scope, e.g. the built-in inline decorator registers a partial.
+func (r *renderer) renderDecorator(node *DecoratorNode, f *frame) {
+	name := blockName(node.Expr)
+	dec := r.tmpl.decorators[name]
+	if dec == nil {
+		r.setErr(fmt.Errorf("handlebars: unknown decorator %q", name))
+		return
+	}
+	args, hash := r.evalArgs(f, node.Expr)
+	dec(&DecoratorOptions{Name: name, Args: args, Hash: hash, Program: node.Program, frame: f})
 }
 
 func (r *renderer) renderMustache(node *MustacheNode, f *frame) {
 	v := r.evalExpr(f, node.Expr)
-	if node.Unescaped {
+	if node.Unescaped || r.tmpl.cfg.noEscape {
 		r.buf.WriteString(formatValue(v))
 		return
 	}
@@ -169,6 +214,37 @@ func (r *renderer) renderMustache(node *MustacheNode, f *frame) {
 		return
 	}
 	r.buf.WriteString(EscapeHTML(formatValue(v)))
+}
+
+// lookupHelper returns the helper registered under name, honouring the
+// knownHelpersOnly compile option.
+func (r *renderer) lookupHelper(name string) Helper {
+	if name == "" {
+		return nil
+	}
+	h := r.tmpl.helpers[name]
+	if h == nil {
+		return nil
+	}
+	if r.tmpl.cfg.knownHelpersOnly && !r.knownHelper(name) {
+		return nil
+	}
+	return h
+}
+
+// knownHelper reports whether name is treated as a helper under knownHelpersOnly.
+func (r *renderer) knownHelper(name string) bool {
+	if r.tmpl.cfg.knownHelpers[name] {
+		return true
+	}
+	return defaultKnownHelpers[name]
+}
+
+// defaultKnownHelpers are the names Handlebars always treats as helpers, used
+// when the knownHelpersOnly option is set.
+var defaultKnownHelpers = map[string]bool{
+	"helperMissing": true, "blockHelperMissing": true, "each": true, "if": true,
+	"unless": true, "with": true, "log": true, "lookup": true,
 }
 
 // evalExpr evaluates an expression to a Go value in a value context.
@@ -183,14 +259,23 @@ func (r *renderer) evalExpr(f *frame, e *Expr) interface{} {
 	case exprSubexpr:
 		return r.callInlineHelper(f, e)
 	default: // exprPath
-		if len(e.Params) > 0 || len(e.Hash) > 0 {
-			return r.callInlineHelper(f, e)
-		}
 		name := blockName(e)
-		if name != "" && r.tmpl.helpers[name] != nil {
+		if len(e.Params) > 0 || len(e.Hash) > 0 {
+			if r.lookupHelper(name) == nil {
+				return r.helperMissing(f, e, name)
+			}
 			return r.callInlineHelper(f, e)
 		}
-		v, _ := resolvePath(f, e.Path)
+		if r.lookupHelper(name) != nil {
+			return r.callInlineHelper(f, e)
+		}
+		if e.Path.Data && !r.tmpl.cfg.data {
+			return nil
+		}
+		v, ok := resolvePath(f, e.Path)
+		if !ok && r.tmpl.cfg.strict && !e.Path.Data {
+			r.setErr(fmt.Errorf("handlebars: %q not defined in strict mode", e.Path.Original))
+		}
 		return v
 	}
 }
@@ -213,14 +298,34 @@ func (r *renderer) evalArgs(f *frame, e *Expr) ([]interface{}, map[string]interf
 // callInlineHelper invokes a helper (or subexpression) in a value context.
 func (r *renderer) callInlineHelper(f *frame, e *Expr) interface{} {
 	name := blockName(e)
-	h := r.tmpl.helpers[name]
+	h := r.lookupHelper(name)
 	if h == nil {
-		r.setErr(fmt.Errorf("handlebars: unknown helper %q", name))
-		return nil
+		return r.helperMissing(f, e, name)
 	}
 	args, hash := r.evalArgs(f, e)
 	o := &Options{Name: name, Args: args, Hash: hash, r: r, frame: f}
 	return h(o)
+}
+
+// helperMissing handles a call to a name that is not a registered helper. If a
+// "helperMissing" hook is registered it is invoked; otherwise the default
+// behaviour applies: a bare {{name}} resolves as a path (empty if absent) while
+// a call with arguments is an error, matching Handlebars.js.
+func (r *renderer) helperMissing(f *frame, e *Expr, name string) interface{} {
+	args, hash := r.evalArgs(f, e)
+	if hook := r.tmpl.helpers["helperMissing"]; hook != nil {
+		o := &Options{Name: name, Args: args, Hash: hash, r: r, frame: f}
+		return hook(o)
+	}
+	if len(args) == 0 && len(hash) == 0 {
+		v, ok := resolvePath(f, e.Path)
+		if !ok && r.tmpl.cfg.strict {
+			r.setErr(fmt.Errorf("handlebars: %q not defined in strict mode", e.Path.Original))
+		}
+		return v
+	}
+	r.setErr(fmt.Errorf("handlebars: missing helper %q", name))
+	return nil
 }
 
 // renderBlock dispatches a block node to a built-in or custom helper, or to the
@@ -241,10 +346,23 @@ func (r *renderer) renderBlock(node *BlockNode, f *frame) {
 		r.builtinWith(node, f)
 		return
 	}
-	if h := r.tmpl.helpers[name]; h != nil && name != "" {
+	if h := r.lookupHelper(name); h != nil {
 		args, hash := r.evalArgs(f, node.Expr)
 		o := &Options{Name: name, Args: args, Hash: hash, r: r, frame: f, block: node}
 		r.buf.WriteString(formatValue(h(o)))
+		return
+	}
+	r.blockHelperMissing(node, f)
+}
+
+// blockHelperMissing handles {{#name}} where name is not a registered block
+// helper. A "blockHelperMissing" hook takes precedence; otherwise the default
+// Mustache section behaviour applies.
+func (r *renderer) blockHelperMissing(node *BlockNode, f *frame) {
+	if hook := r.tmpl.helpers["blockHelperMissing"]; hook != nil {
+		v := r.evalExpr(f, node.Expr)
+		o := &Options{Name: blockName(node.Expr), Args: []interface{}{v}, r: r, frame: f, block: node}
+		r.buf.WriteString(formatValue(hook(o)))
 		return
 	}
 	r.builtinSection(node, f)
@@ -271,7 +389,9 @@ func (r *renderer) builtinWith(node *BlockNode, f *frame) {
 		v = r.evalExpr(f, node.Expr.Params[0])
 	}
 	if isTruthy(v) {
-		r.renderProgram(node.mainProg(), f.child(v))
+		child := f.child(v)
+		bindBlockParams(child, node.Params, v)
+		r.renderProgram(node.mainProg(), child)
 	} else {
 		r.renderProgram(node.elseProg(), f)
 	}
@@ -282,8 +402,23 @@ func (r *renderer) builtinEach(node *BlockNode, f *frame) {
 	if len(node.Expr.Params) > 0 {
 		coll = r.evalExpr(f, node.Expr.Params[0])
 	}
-	if !r.iterate(coll, node.mainProg(), f) {
+	if !r.iterateBlock(coll, node, f) {
 		r.renderProgram(node.elseProg(), f)
+	}
+}
+
+// bindBlockParams binds a block's "as |a b|" names on a child frame. The first
+// name receives the value and the second (if any) the index or key.
+func bindBlockParams(child *frame, names []string, value interface{}, extra ...interface{}) {
+	if len(names) == 0 {
+		return
+	}
+	child.blockParams = map[string]interface{}{}
+	child.blockParams[names[0]] = value
+	for i, ex := range extra {
+		if i+1 < len(names) {
+			child.blockParams[names[i+1]] = ex
+		}
 	}
 }
 
@@ -305,12 +440,20 @@ func (r *renderer) builtinSection(node *BlockNode, f *frame) {
 	}
 }
 
-// iterate ranges over a slice/array/map, exposing @index/@key/@first/@last, and
-// reports whether anything was rendered (false for empty/non-iterable values).
+// iterate ranges over a slice/array/map without block parameters. It is used by
+// the default section behaviour for plain {{#collection}} blocks.
 func (r *renderer) iterate(coll interface{}, prog *Program, f *frame) bool {
+	return r.iterateBlock(coll, &BlockNode{Program: prog}, f)
+}
+
+// iterateBlock ranges over a slice/array/map, exposing @index/@key/@first/@last
+// and any declared block parameters, and reports whether anything was rendered
+// (false for empty/non-iterable values).
+func (r *renderer) iterateBlock(coll interface{}, node *BlockNode, f *frame) bool {
 	if coll == nil {
 		return false
 	}
+	prog := node.mainProg()
 	rv := reflect.ValueOf(coll)
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
@@ -319,11 +462,13 @@ func (r *renderer) iterate(coll interface{}, prog *Program, f *frame) bool {
 			return false
 		}
 		for i := 0; i < n; i++ {
-			child := f.child(rv.Index(i).Interface())
+			elem := rv.Index(i).Interface()
+			child := f.child(elem)
 			child.data["index"] = i
 			child.data["key"] = i
 			child.data["first"] = i == 0
 			child.data["last"] = i == n-1
+			bindBlockParams(child, node.Params, elem, i)
 			r.renderProgram(prog, child)
 		}
 		return true
@@ -333,11 +478,13 @@ func (r *renderer) iterate(coll interface{}, prog *Program, f *frame) bool {
 			return false
 		}
 		for i, k := range keys {
-			child := f.child(rv.MapIndex(k).Interface())
+			elem := rv.MapIndex(k).Interface()
+			child := f.child(elem)
 			child.data["index"] = i
 			child.data["key"] = k.Interface()
 			child.data["first"] = i == 0
 			child.data["last"] = i == len(keys)-1
+			bindBlockParams(child, node.Params, elem, k.Interface())
 			r.renderProgram(prog, child)
 		}
 		return true
@@ -348,11 +495,21 @@ func (r *renderer) iterate(coll interface{}, prog *Program, f *frame) bool {
 
 func (r *renderer) renderPartial(node *PartialNode, f *frame) {
 	name := r.partialName(f, node)
-	prog, ok := r.tmpl.partials[name]
-	if !ok {
+
+	// Resolve the partial program: @partial-block, in-scope inline / block
+	// partials, then the template's global registry.
+	prog, defFrame := r.resolvePartial(f, name)
+	if prog == nil {
+		// A partial block ({{#> layout}}body{{/layout}}) whose partial is missing
+		// falls back to rendering its own body.
+		if node.Program != nil {
+			r.buf.WriteString(r.renderProgramToString(node.Program, f))
+			return
+		}
 		r.setErr(fmt.Errorf("handlebars: unknown partial %q", name))
 		return
 	}
+
 	ctx := f.ctx
 	if node.Context != nil {
 		ctx = r.evalExpr(f, node.Context)
@@ -364,11 +521,37 @@ func (r *renderer) renderPartial(node *PartialNode, f *frame) {
 		}
 		ctx = &overlay{base: ctx, data: data}
 	}
-	out := r.renderProgramToString(prog, f.child(ctx))
+
+	child := f.child(ctx)
+	// A partial block makes its body available as @partial-block inside the
+	// invoked partial, rendered against the calling context.
+	if node.Program != nil {
+		child.setPartial("@partial-block", &partialDef{prog: node.Program, frame: f})
+	}
+	// Captured @partial-block content renders against its original frame.
+	if defFrame != nil {
+		child = defFrame.child(defFrame.ctx)
+	}
+
+	out := r.renderProgramToString(prog, child)
 	if node.Indent != "" {
 		out = indentLines(out, node.Indent)
 	}
 	r.buf.WriteString(out)
+}
+
+// resolvePartial finds a partial by name, checking @partial-block and in-scope
+// inline/partial-block partials before the template's global registry. It
+// returns the program and, for captured @partial-block content, the frame it
+// should render against (nil otherwise).
+func (r *renderer) resolvePartial(f *frame, name string) (*Program, *frame) {
+	if def, ok := f.localPartial(name); ok {
+		return def.prog, def.frame
+	}
+	if prog, ok := r.tmpl.partials[name]; ok {
+		return prog, nil
+	}
+	return nil, nil
 }
 
 func (r *renderer) partialName(f *frame, node *PartialNode) string {

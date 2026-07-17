@@ -9,23 +9,39 @@ import (
 // context (each, with, default sections) pushes a new frame whose parent points
 // at the enclosing scope, enabling ../ path traversal.
 type frame struct {
-	ctx    interface{}
-	parent *frame
-	data   map[string]interface{} // @-variables such as @index, @key, @root
+	ctx         interface{}
+	parent      *frame
+	data        map[string]interface{} // @-variables such as @index, @key, @root
+	blockParams map[string]interface{} // names declared by "as |a b|"
+	partials    map[string]*partialDef // in-scope inline / partial-block partials
 }
 
-// newRootFrame creates the base frame for a render, seeding @root.
+// partialDef is an in-scope partial, either an inline partial (frame nil, render
+// against the call context) or a captured @partial-block (render against frame).
+type partialDef struct {
+	prog  *Program
+	frame *frame
+}
+
+// newRootFrame creates the base frame for a render, seeding @root and @level.
 func newRootFrame(ctx interface{}) *frame {
 	f := &frame{ctx: ctx, data: map[string]interface{}{}}
 	f.data["root"] = ctx
+	f.data["level"] = 0
 	return f
 }
 
-// child pushes a new frame with the given context, inheriting @root.
+// child pushes a new frame with the given context, inheriting @root and
+// incrementing the nesting @level.
 func (f *frame) child(ctx interface{}) *frame {
 	data := map[string]interface{}{}
 	if root, ok := f.dataVar("root"); ok {
 		data["root"] = root
+	}
+	if lvl, ok := f.dataVar("level"); ok {
+		if n, isInt := lvl.(int); isInt {
+			data["level"] = n + 1
+		}
 	}
 	return &frame{ctx: ctx, parent: f, data: data}
 }
@@ -40,6 +56,38 @@ func (f *frame) dataVar(name string) (interface{}, bool) {
 		}
 	}
 	return nil, false
+}
+
+// blockParam resolves a block-parameter name, walking up parent frames.
+func (f *frame) blockParam(name string) (interface{}, bool) {
+	for cur := f; cur != nil; cur = cur.parent {
+		if cur.blockParams != nil {
+			if v, ok := cur.blockParams[name]; ok {
+				return v, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// localPartial resolves an in-scope inline or partial-block partial by name.
+func (f *frame) localPartial(name string) (*partialDef, bool) {
+	for cur := f; cur != nil; cur = cur.parent {
+		if cur.partials != nil {
+			if v, ok := cur.partials[name]; ok {
+				return v, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// setPartial registers an in-scope partial on this frame.
+func (f *frame) setPartial(name string, def *partialDef) {
+	if f.partials == nil {
+		f.partials = map[string]*partialDef{}
+	}
+	f.partials[name] = def
 }
 
 // resolvePath evaluates a path against the frame stack, returning the value and
@@ -71,6 +119,13 @@ func resolvePath(f *frame, p *Path) (interface{}, bool) {
 
 	if p.This || len(p.Segments) == 0 {
 		return base.ctx, true
+	}
+
+	// Block parameters (as |a b|) shadow the context and are lexically scoped.
+	if p.Depth == 0 {
+		if v, ok := base.blockParam(p.Segments[0]); ok {
+			return walk(v, p.Segments[1:])
+		}
 	}
 	return walk(base.ctx, p.Segments)
 }

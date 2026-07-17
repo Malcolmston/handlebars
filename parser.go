@@ -50,9 +50,12 @@ func (p *parser) parseBody() (*Program, *token, error) {
 		case mkBlockClose:
 			p.next() // consume the {{/name}}
 			return prog, &t, nil
+		case mkElse:
+			p.next() // consume the {{else}} / {{else if ...}}
+			return prog, &t, nil
 		case mkInverse:
-			if t.text == "" { // bare {{else}} / {{^}}
-				p.next() // consume the {{else}}/{{^}}
+			if t.text == "" { // bare {{^}}
+				p.next() // consume the {{^}}
 				return prog, &t, nil
 			}
 			node, err := p.parseBlock(true)
@@ -66,6 +69,25 @@ func (p *parser) parseBody() (*Program, *token, error) {
 				return nil, nil, err
 			}
 			prog.Body = append(prog.Body, node)
+		case mkPartialBlock:
+			node, err := p.parsePartialBlock()
+			if err != nil {
+				return nil, nil, err
+			}
+			prog.Body = append(prog.Body, node)
+		case mkDecoratorBlock:
+			node, err := p.parseDecoratorBlock()
+			if err != nil {
+				return nil, nil, err
+			}
+			prog.Body = append(prog.Body, node)
+		case mkDecorator:
+			p.next()
+			expr, err := parseMustacheExpr(t.text)
+			if err != nil {
+				return nil, nil, err
+			}
+			prog.Body = append(prog.Body, &DecoratorNode{Expr: expr})
 		case mkComment:
 			p.next()
 			prog.Body = append(prog.Body, &CommentNode{Value: t.text})
@@ -99,8 +121,78 @@ func (p *parser) parseBody() (*Program, *token, error) {
 }
 
 // parseBlock parses a {{#name}}...{{/name}} (or {{^name}}...{{/name}}) block,
-// including an optional {{else}} inverse section.
+// including any {{else}} / {{else if}} chain.
 func (p *parser) parseBlock(inverted bool) (Node, error) {
+	open := p.next()
+	return p.finishBlock(open.text, inverted)
+}
+
+// finishBlock parses a block body (headText is the opening expression, already
+// consumed) followed by an optional inverse or {{else if}} chain and the closing
+// tag. It is shared by {{#name}} openers and synthesised {{else if}} heads.
+func (p *parser) finishBlock(headText string, inverted bool) (Node, error) {
+	exprText, params := extractBlockParams(headText)
+	expr, err := parseMustacheExpr(exprText)
+	if err != nil {
+		return nil, err
+	}
+	body, stop, err := p.parseBody()
+	if err != nil {
+		return nil, err
+	}
+	block := &BlockNode{Expr: expr, Program: body, Inverted: inverted, Params: params}
+	if stop == nil {
+		return nil, fmt.Errorf("handlebars: unclosed block {{#%s}}", headText)
+	}
+	switch {
+	case stop.mkind == mkElse && stop.text != "":
+		// {{else if cond}} / {{else with x}}: a chained block that shares this
+		// block's closing tag. It becomes the sole content of the inverse.
+		chained, err := p.finishBlock(stop.text, false)
+		if err != nil {
+			return nil, err
+		}
+		block.Inverse = &Program{Body: []Node{chained}}
+	case stop.mkind == mkElse || (stop.mkind == mkInverse && stop.text == ""):
+		inv, stop2, err := p.parseBody()
+		if err != nil {
+			return nil, err
+		}
+		block.Inverse = inv
+		if stop2 == nil || stop2.mkind != mkBlockClose {
+			return nil, fmt.Errorf("handlebars: unclosed block {{#%s}}", headText)
+		}
+	case stop.mkind == mkBlockClose:
+		// body fully closed
+	default:
+		return nil, fmt.Errorf("handlebars: unclosed block {{#%s}}", headText)
+	}
+	return block, nil
+}
+
+// parsePartialBlock parses {{#> name}}...{{/name}}, capturing the block body as
+// the partial's @partial-block.
+func (p *parser) parsePartialBlock() (Node, error) {
+	open := p.next()
+	node, err := parsePartial(open)
+	if err != nil {
+		return nil, err
+	}
+	pn := node.(*PartialNode)
+	body, stop, err := p.parseBody()
+	if err != nil {
+		return nil, err
+	}
+	if stop == nil || stop.mkind != mkBlockClose {
+		return nil, fmt.Errorf("handlebars: unclosed partial block {{#>%s}}", open.text)
+	}
+	pn.Program = body
+	return pn, nil
+}
+
+// parseDecoratorBlock parses {{#*name args}}...{{/name}} such as the inline
+// partial form {{#*inline "row"}}...{{/inline}}.
+func (p *parser) parseDecoratorBlock() (Node, error) {
 	open := p.next()
 	expr, err := parseMustacheExpr(open.text)
 	if err != nil {
@@ -110,22 +202,34 @@ func (p *parser) parseBlock(inverted bool) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	block := &BlockNode{Expr: expr, Program: body, Inverted: inverted}
-	if stop == nil {
-		return nil, fmt.Errorf("handlebars: unclosed block {{#%s}}", open.text)
+	if stop == nil || stop.mkind != mkBlockClose {
+		return nil, fmt.Errorf("handlebars: unclosed decorator block {{#*%s}}", open.text)
 	}
-	if stop.mkind == mkInverse { // an {{else}} was found
-		inv, stop2, err := p.parseBody()
-		if err != nil {
-			return nil, err
-		}
-		block.Inverse = inv
-		if stop2 == nil || stop2.mkind != mkBlockClose {
-			return nil, fmt.Errorf("handlebars: unclosed block {{#%s}}", open.text)
-		}
-	}
-	return block, nil
+	return &DecoratorNode{Expr: expr, Program: body}, nil
 }
+
+// extractBlockParams splits a trailing block-parameter clause "as |a b|" from a
+// block's opening expression, returning the bare expression text and the
+// declared parameter names.
+func extractBlockParams(head string) (string, []string) {
+	open := strings.LastIndex(head, "|")
+	bar := strings.Index(head, "|")
+	if bar < 0 || open == bar {
+		return head, nil
+	}
+	// Require an "as" keyword immediately before the opening bar.
+	before := strings.TrimRight(head[:bar], " \t")
+	if !strings.HasSuffix(before, "as") ||
+		(len(before) > 2 && !isSpace(before[len(before)-3])) {
+		return head, nil
+	}
+	inner := head[bar+1 : open]
+	names := strings.Fields(inner)
+	exprText := strings.TrimSpace(before[:len(before)-2])
+	return exprText, names
+}
+
+func isSpace(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
 
 // parsePartial builds a PartialNode from a {{> ...}} token.
 func parsePartial(t token) (Node, error) {

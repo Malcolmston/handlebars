@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 semantic versioning.
 
+## [Unreleased]
+
+- Upstream-parity audit vs handlebars-lang/handlebars.js: synced spec vectors as `*_parity_test.go`; closed gaps in backslash mustache escaping (`\{{foo}}`), quoted/number literal-as-path references, `#if includeZero`, the string `length` virtual property, `/` path separators (`foo/bar`), bracketed literal `[this]`, whitespace control on long comments (`{{!-- --~}}`) and the raw `{{~{foo}~}}` form, standalone-tag trailing whitespace at EOF, decimal number literals (`1.2`), bare parent references (`{{..}}`), empty-object truthiness in `#if`/`#with`/`#unless`, and ambiguous `helperMissing` on undefined bare names.
+
 ## [0.3.0] - 2026-07-18
 
 Further Handlebars.js parity, focused on the runtime registry and the `Utils`

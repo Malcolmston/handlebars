@@ -67,9 +67,37 @@ func (l *lexer) lex() ([]token, error) {
 			l.advance(len(text))
 			break
 		}
+		before := l.src[l.pos : l.pos+open]
+		// Count backslashes immediately preceding the "{{". An escaped mustache
+		// (odd count) is emitted verbatim as content; a doubled backslash (even
+		// count) yields one literal backslash and a live mustache. This mirrors
+		// the Handlebars.js "\{{foo}}" / "\\{{foo}}" escaping rules.
+		bs := 0
+		for bs < len(before) && before[len(before)-1-bs] == '\\' {
+			bs++
+		}
+		startLine := l.line
+		if bs > 0 {
+			content := before[:len(before)-bs] + strings.Repeat("\\", bs/2)
+			if content != "" {
+				toks = append(toks, token{kind: tContent, text: content, line: startLine})
+			}
+			l.advance(open)
+			if bs%2 == 1 {
+				raw, n := l.rawMustache()
+				toks = append(toks, token{kind: tContent, text: raw, line: l.line})
+				l.advance(n)
+				continue
+			}
+			tok, err := l.lexMustache()
+			if err != nil {
+				return nil, err
+			}
+			toks = append(toks, tok)
+			continue
+		}
 		if open > 0 {
-			text := l.src[l.pos : l.pos+open]
-			toks = append(toks, token{kind: tContent, text: text, line: l.line})
+			toks = append(toks, token{kind: tContent, text: before, line: startLine})
 			l.advance(open)
 		}
 		tok, err := l.lexMustache()
@@ -98,8 +126,15 @@ func applyWhitespaceControl(toks []token) {
 			trimContentLeft(toks, i)
 		}
 		if t.standalone {
-			t.indent = stripStandaloneLeft(toks, i)
-			stripStandaloneRight(toks, i)
+			// An explicit ~ trim on a side supersedes the standalone rule for
+			// that side; applying both would let stripStandaloneLeft mistake
+			// already-trimmed content for indentation.
+			if !t.trimLeft {
+				t.indent = stripStandaloneLeft(toks, i)
+			}
+			if !t.trimRight {
+				stripStandaloneRight(toks, i)
+			}
 		}
 	}
 }
@@ -152,6 +187,12 @@ func stripStandaloneRight(toks []token, i int) {
 	if j < len(text) && text[j] == '\n' {
 		j++
 		toks[i+1].text = text[j:]
+		return
+	}
+	// A standalone tag whose line ends at the template's end (no terminating
+	// newline) still consumes the trailing whitespace, matching Handlebars.
+	if j == len(text) && i+1 == len(toks)-1 {
+		toks[i+1].text = ""
 	}
 }
 
@@ -165,18 +206,27 @@ func (l *lexer) advance(n int) {
 	}
 }
 
+// rawMustache returns the verbatim text of the mustache beginning at the cursor
+// (including its delimiters) and its byte length. It is used to emit an escaped
+// "\{{...}}" mustache as literal content. A triple "{{{...}}}" is closed by
+// "}}}"; every other form is closed by "}}".
+func (l *lexer) rawMustache() (string, int) {
+	s := l.src[l.pos:]
+	closing := "}}"
+	if strings.HasPrefix(s, "{{{") {
+		closing = "}}}"
+	}
+	idx := strings.Index(s, closing)
+	if idx < 0 {
+		return s, len(s)
+	}
+	end := idx + len(closing)
+	return s[:end], end
+}
+
 // lexMustache consumes a single {{ ... }} construct starting at the cursor.
 func (l *lexer) lexMustache() (token, error) {
 	startLine := l.line
-	// Triple-stache {{{ expr }}}.
-	if strings.HasPrefix(l.src[l.pos:], "{{{") {
-		l.advance(3)
-		inner, err := l.readUntil("}}}")
-		if err != nil {
-			return token{}, err
-		}
-		return token{kind: tMustache, mkind: mkUnescaped, text: strings.TrimSpace(inner), line: startLine}, nil
-	}
 	l.advance(2) // consume {{
 
 	trimLeft := false
@@ -185,17 +235,32 @@ func (l *lexer) lexMustache() (token, error) {
 		l.advance(1)
 	}
 
+	// Unescaped triple-stache {{{ expr }}} and its whitespace-control variant
+	// {{~{ expr }~}}. The inner braces select raw (non-HTML-escaped) output. This
+	// is handled after the leading ~ so the tilde form is recognised too.
+	if l.peek() == '{' {
+		l.advance(1)
+		inner, trimRight, err := l.readUnescaped()
+		if err != nil {
+			return token{}, err
+		}
+		return token{kind: tMustache, mkind: mkUnescaped, text: strings.TrimSpace(inner),
+			trimLeft: trimLeft, trimRight: trimRight, line: startLine}, nil
+	}
+
 	// Comments have their own delimiters.
 	if l.peek() == '!' {
 		l.advance(1)
-		var inner string
-		var err error
 		if strings.HasPrefix(l.src[l.pos:], "--") {
 			l.advance(2)
-			inner, err = l.readUntil("--}}")
-		} else {
-			inner, err = l.readCommentUntilClose()
+			inner, trimRight, err := l.readLongComment()
+			if err != nil {
+				return token{}, err
+			}
+			return token{kind: tMustache, mkind: mkComment, text: strings.TrimSpace(inner),
+				trimLeft: trimLeft, trimRight: trimRight, line: startLine}, nil
 		}
+		inner, err := l.readCommentUntilClose()
 		if err != nil {
 			return token{}, err
 		}
@@ -287,6 +352,53 @@ func (l *lexer) readUntil(closing string) (string, error) {
 		l.advance(1)
 	}
 	return "", l.errorf("unclosed %q", closing)
+}
+
+// readUnescaped reads the body of an unescaped {{{ ... }}} mustache after its
+// inner "{" has been consumed. The body ends at the first "}" that is followed
+// by "}}" (or "~}}" for the whitespace-control form). The returned bool reports
+// whether that trailing "~" trim marker was present.
+func (l *lexer) readUnescaped() (string, bool, error) {
+	start := l.pos
+	for l.pos < len(l.src) {
+		if l.src[l.pos] == '}' {
+			rest := l.src[l.pos+1:]
+			if strings.HasPrefix(rest, "~}}") {
+				inner := l.src[start:l.pos]
+				l.advance(4)
+				return inner, true, nil
+			}
+			if strings.HasPrefix(rest, "}}") {
+				inner := l.src[start:l.pos]
+				l.advance(3)
+				return inner, false, nil
+			}
+		}
+		l.advance(1)
+	}
+	return "", false, l.errorf("unclosed %q", "}}}")
+}
+
+// readLongComment reads the body of a {{!-- ... --}} comment after the leading
+// "!--" has been consumed. It closes on "--}}" or, for the whitespace-control
+// form, "--~}}"; the returned bool reports whether the "~" trim marker was
+// present. Long comments may contain "}}" so a dedicated terminator is required.
+func (l *lexer) readLongComment() (string, bool, error) {
+	start := l.pos
+	for l.pos < len(l.src) {
+		if strings.HasPrefix(l.src[l.pos:], "--~}}") {
+			inner := l.src[start:l.pos]
+			l.advance(5)
+			return inner, true, nil
+		}
+		if strings.HasPrefix(l.src[l.pos:], "--}}") {
+			inner := l.src[start:l.pos]
+			l.advance(4)
+			return inner, false, nil
+		}
+		l.advance(1)
+	}
+	return "", false, l.errorf("unclosed %q", "--}}")
 }
 
 // readCommentUntilClose reads a short comment terminated by the first "}}".

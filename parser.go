@@ -360,7 +360,10 @@ func classifyWord(w string) atom {
 	case "null", "undefined":
 		return atom{kind: aPath, val: w} // resolves to nil at render time
 	}
-	if !strings.ContainsAny(w, ".[/") {
+	// Numeric literals may contain a decimal point (e.g. 1.2, -1.2), so only the
+	// path-only characters "[" and "/" disqualify a word from being a number.
+	// A dotted path such as foo.bar fails ParseFloat and falls through to a path.
+	if !strings.ContainsAny(w, "[/") {
 		if n, err := strconv.ParseFloat(w, 64); err == nil {
 			return atom{kind: aNumber, num: n}
 		}
@@ -440,9 +443,19 @@ func parsePath(s string) *Path {
 		p.Data = true
 		rest = rest[1:]
 	}
-	for strings.HasPrefix(rest, "../") {
-		p.Depth++
-		rest = rest[3:]
+	// Leading parent references: "../" before more path, or a standalone ".."
+	// meaning the parent context itself (Handlebars {{..}}).
+	for {
+		if strings.HasPrefix(rest, "../") {
+			p.Depth++
+			rest = rest[3:]
+			continue
+		}
+		if rest == ".." {
+			p.Depth++
+			rest = ""
+		}
+		break
 	}
 	rest = strings.TrimPrefix(rest, "./")
 	if rest == "" || rest == "this" || rest == "." {
@@ -450,15 +463,20 @@ func parsePath(s string) *Path {
 		return p
 	}
 	segs := splitPath(rest)
-	if len(segs) > 0 && segs[0] == "this" {
+	// A leading, unbracketed "this" segment is the current-context keyword and is
+	// dropped (e.g. this/text == text). A bracketed [this] names a literal
+	// property and must be kept, so only strip when the source did not bracket
+	// the first segment.
+	if len(segs) > 0 && segs[0] == "this" && !strings.HasPrefix(rest, "[") {
 		segs = segs[1:]
 	}
 	p.Segments = segs
 	return p
 }
 
-// splitPath breaks a path body into dotted segments, honouring [bracket]
-// segments that may contain otherwise-special characters.
+// splitPath breaks a path body into segments, honouring both "." and "/" as
+// segment separators (Handlebars accepts foo.bar and foo/bar interchangeably)
+// and [bracket] segments that may contain otherwise-special characters.
 func splitPath(s string) []string {
 	var segs []string
 	var cur strings.Builder
@@ -475,7 +493,7 @@ func splitPath(s string) []string {
 			i += k + 1
 			continue
 		}
-		if c == '.' {
+		if c == '.' || c == '/' {
 			segs = append(segs, cur.String())
 			cur.Reset()
 			i++

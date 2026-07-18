@@ -204,7 +204,7 @@ func (r *renderer) renderDecorator(node *DecoratorNode, f *frame) {
 }
 
 func (r *renderer) renderMustache(node *MustacheNode, f *frame) {
-	v := r.evalExpr(f, node.Expr)
+	v := r.evalCallee(f, node.Expr)
 	if node.Unescaped || r.tmpl.cfg.noEscape {
 		r.buf.WriteString(formatValue(v))
 		return
@@ -247,6 +247,28 @@ var defaultKnownHelpers = map[string]bool{
 	"unless": true, "with": true, "log": true, "lookup": true,
 }
 
+// evalCallee evaluates a mustache or section head expression. A bare string or
+// number literal in this leading position is resolved as a path lookup by that
+// literal's key (Handlebars.js "literal references", e.g. {{"foo bar"}} looks up
+// the "foo bar" property), whereas the same literal used as an argument keeps
+// its literal value. All other expressions defer to evalExpr.
+func (r *renderer) evalCallee(f *frame, e *Expr) interface{} {
+	if len(e.Params) == 0 && len(e.Hash) == 0 {
+		var key string
+		switch e.Kind {
+		case exprString:
+			key = e.Str
+		case exprNumber:
+			key = strconv.FormatFloat(e.Num, 'f', -1, 64)
+		default:
+			return r.evalExpr(f, e)
+		}
+		v, _ := resolvePath(f, &Path{Segments: []string{key}, Original: key})
+		return v
+	}
+	return r.evalExpr(f, e)
+}
+
 // evalExpr evaluates an expression to a Go value in a value context.
 func (r *renderer) evalExpr(f *frame, e *Expr) interface{} {
 	switch e.Kind {
@@ -273,11 +295,28 @@ func (r *renderer) evalExpr(f *frame, e *Expr) interface{} {
 			return nil
 		}
 		v, ok := resolvePath(f, e.Path)
-		if !ok && r.tmpl.cfg.strict && !e.Path.Data {
-			r.setErr(fmt.Errorf("handlebars: %q not defined in strict mode", e.Path.Original))
+		if !ok {
+			// An ambiguous bare mustache ({{name}}) whose name is neither a
+			// registered helper nor found in the context invokes a custom
+			// helperMissing hook if one is registered, matching Handlebars.js.
+			// The default (no hook) still renders the empty string.
+			if hook := r.tmpl.helpers["helperMissing"]; hook != nil && isAmbiguousName(e.Path) {
+				return hook(&Options{Name: name, r: r, frame: f})
+			}
+			if r.tmpl.cfg.strict && !e.Path.Data {
+				r.setErr(fmt.Errorf("handlebars: %q not defined in strict mode", e.Path.Original))
+			}
 		}
 		return v
 	}
+}
+
+// isAmbiguousName reports whether a path is a single, bare identifier (no ".",
+// no "../", no leading "@" and not "this"). Only such names occupy the
+// helper-or-context "ambiguous" position that triggers helperMissing in
+// Handlebars.js; dotted or data paths that resolve to nothing stay empty.
+func isAmbiguousName(p *Path) bool {
+	return p != nil && !p.Data && !p.This && p.Depth == 0 && len(p.Segments) == 1
 }
 
 func (r *renderer) evalArgs(f *frame, e *Expr) ([]interface{}, map[string]interface{}) {
@@ -371,7 +410,13 @@ func (r *renderer) blockHelperMissing(node *BlockNode, f *frame) {
 func (r *renderer) builtinIf(node *BlockNode, f *frame, negate bool) {
 	var cond bool
 	if len(node.Expr.Params) > 0 {
-		cond = isTruthy(r.evalExpr(f, node.Expr.Params[0]))
+		v := r.evalExpr(f, node.Expr.Params[0])
+		cond = blockTruthy(v)
+		// With includeZero=true a numeric zero counts as truthy, matching the
+		// Handlebars.js #if helper's includeZero hash option.
+		if !cond && !negate && isZeroNumber(v) && r.hashFlag(f, node.Expr, "includeZero") {
+			cond = true
+		}
 	}
 	if negate {
 		cond = !cond
@@ -383,12 +428,44 @@ func (r *renderer) builtinIf(node *BlockNode, f *frame, negate bool) {
 	}
 }
 
+// hashFlag reports whether the named hash argument of e is present and truthy.
+func (r *renderer) hashFlag(f *frame, e *Expr, key string) bool {
+	for _, hp := range e.Hash {
+		if hp.Key == key {
+			return isTruthy(r.evalExpr(f, hp.Value))
+		}
+	}
+	return false
+}
+
+// isZeroNumber reports whether v is a numeric zero (any Go integer or float
+// kind). It is used by #if includeZero handling.
+func isZeroNumber(v interface{}) bool {
+	switch t := v.(type) {
+	case float64:
+		return t == 0
+	case float32:
+		return t == 0
+	case int:
+		return t == 0
+	case int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return rv.Int() == 0
+		default:
+			return rv.Uint() == 0
+		}
+	}
+	return false
+}
+
 func (r *renderer) builtinWith(node *BlockNode, f *frame) {
 	var v interface{}
 	if len(node.Expr.Params) > 0 {
 		v = r.evalExpr(f, node.Expr.Params[0])
 	}
-	if isTruthy(v) {
+	if blockTruthy(v) {
 		child := f.child(v)
 		bindBlockParams(child, node.Params, v)
 		r.renderProgram(node.mainProg(), child)
@@ -425,7 +502,7 @@ func bindBlockParams(child *frame, names []string, value interface{}, extra ...i
 // builtinSection implements plain {{#foo}} / {{^foo}} sections: iterate over
 // collections, descend into truthy objects, or render the inverse otherwise.
 func (r *renderer) builtinSection(node *BlockNode, f *frame) {
-	v := r.evalExpr(f, node.Expr)
+	v := r.evalCallee(f, node.Expr)
 	rv := reflect.ValueOf(v)
 	if v != nil && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
 		if !r.iterate(v, node.mainProg(), f) {

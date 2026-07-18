@@ -3,6 +3,7 @@ package handlebars
 import (
 	"reflect"
 	"strconv"
+	"unicode/utf8"
 )
 
 // frame is one level of the render context stack. Each block that changes the
@@ -168,6 +169,13 @@ func lookup(cur interface{}, seg string) (interface{}, bool) {
 		return lookupStruct(v, seg)
 	case reflect.Slice, reflect.Array:
 		return lookupIndex(v, seg)
+	case reflect.String:
+		// Strings expose a virtual "length" property (their number of Unicode
+		// code points), matching JavaScript's String.length in Handlebars.js.
+		if seg == "length" {
+			return utf8.RuneCountInString(v.String()), true
+		}
+		return nil, false
 	default:
 		return nil, false
 	}
@@ -302,4 +310,19 @@ func isTruthy(v interface{}) bool {
 	default:
 		return true
 	}
+}
+
+// blockTruthy reports whether a value drives the main (non-inverse) branch of
+// the built-in #if, #unless and #with helpers. It follows Handlebars.js, whose
+// block condition is `conditional && !isEmpty(conditional)`: JavaScript-falsy
+// values (nil, false, a zero number, the empty string) and empty arrays take the
+// inverse branch, while every plain object — including an empty map or struct —
+// is truthy. This differs from isTruthy only for a non-nil empty map, which is a
+// JavaScript object and therefore truthy here even though it has no entries.
+func blockTruthy(v interface{}) bool {
+	if isTruthy(v) {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Map && !rv.IsNil()
 }

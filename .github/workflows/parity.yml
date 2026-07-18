@@ -1,0 +1,23 @@
+name: Parity
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  workflow_dispatch: {}
+permissions: { contents: read }
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      # Run only the synced upstream-parity tests and print a summary.
+      - name: Run upstream-parity tests
+        run: go test ./... -run Parity -v 2>&1 | tee parity.txt
+      - name: Parity summary
+        if: always()
+        run: |
+          echo "## Upstream parity" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "PASS|FAIL|parity" parity.txt | tail -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"

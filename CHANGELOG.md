@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 semantic versioning.
 
+## [0.3.0] - 2026-07-18
+
+Further Handlebars.js parity, focused on the runtime registry and the `Utils`
+namespace. All additions are backward compatible and standard-library-only.
+
+### Added
+
+- **Registry management** mirroring the Handlebars.js environment API:
+  `Template.RegisterHelpers` and `Template.RegisterPartials` (bulk registration
+  from a map, matching the object form of `registerHelper`/`registerPartial`),
+  `Template.UnregisterHelper`, `Template.UnregisterPartial` and
+  `Template.UnregisterDecorator`, plus `Template.HasHelper`,
+  `Template.HasPartial`, `Template.HelperNames` and `Template.PartialNames`
+  (sorted, deterministic).
+- **`Template.Clone`**: an isolated deep copy of a template's program, options,
+  logger and registries, mirroring `Handlebars.create`, so a specialised
+  template can be derived from a shared base without mutating it.
+- **`Utils` parity functions**: `EscapeExpression` (SafeString-aware escaping of
+  any value, matching `Utils.escapeExpression`), `Stringify` (the engine's
+  canonical value stringification), `IsEmpty` (matching `Utils.isEmpty`,
+  including the empty-map-is-not-empty rule), `IsArray`, `Extend` and
+  `CreateFrame`.
+
 ## [0.2.0] - 2026-07-17
 
 Major push toward Handlebars.js parity. All additions are backward compatible.

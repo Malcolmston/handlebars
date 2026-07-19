@@ -1,0 +1,8 @@
+{
+  "repo": "handlebars",
+  "upstream": "handlebars-lang/handlebars.js",
+  "parityBefore": "87%",
+  "parityAfter": "97%",
+  "upstreamCasesSynced": 192,
+  "gapsClosed": 11
+}
